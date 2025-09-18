@@ -1,0 +1,383 @@
+// App.tsx — Shortzy! Mobile MVP (Expo + React Native + TypeScript)
+// -----------------------------------------------------------------
+// Drop-in mobile client that talks to the Shortzy! Node/Express backend.
+// Features:
+// - Dev login (email → JWT)
+// - Feed (list projects, like/vote/follow, see raised vs ask)
+// - Pitch (create project)
+// - Create Episode (attach short to a project)
+// - Minimal Insights (totals)
+//
+// Quick start
+//   npx create-expo-app shortzy-mobile -t expo-template-blank-typescript
+//   cd shortzy-mobile
+//   npm i @react-navigation/native @react-navigation/native-stack react-native-safe-area-context react-native-screens
+//   npm i react-native-mmkv
+//   (iOS) npx pod-install
+//   Replace App.tsx with this file.
+//   Set BACKEND_URL below to your API (e.g., http://localhost:4000 when on device/simulator — use your machine IP)
+//   npm run ios | npm run android | npm run web
+
+import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import {
+  Alert,
+  FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { MMKV } from 'react-native-mmkv';
+
+// --------------------------- Config ---------------------------
+const BACKEND_URL = 'http://192.168.1.100:4000'; // TODO: change to your machine IP or hosted URL
+
+// ----------------------- Storage & Auth -----------------------
+const storage = new MMKV();
+
+type Auth = { token: string | null; email: string | null; login: (email: string, name?: string) => Promise<void>; logout: () => void };
+const AuthCtx = createContext<Auth | null>(null);
+
+function useAuth() {
+  const ctx = useContext(AuthCtx);
+  if (!ctx) throw new Error('AuthCtx missing');
+  return ctx;
+}
+
+function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [token, setToken] = useState<string | null>(storage.getString('token') || null);
+  const [email, setEmail] = useState<string | null>(storage.getString('email') || null);
+
+  async function login(emailArg: string, name?: string) {
+    const res = await fetch(`${BACKEND_URL}/auth/dev-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: emailArg, name }),
+    });
+    if (!res.ok) throw new Error('login_failed');
+    const data = await res.json();
+    storage.set('token', data.token);
+    storage.set('email', emailArg);
+    setToken(data.token);
+    setEmail(emailArg);
+  }
+
+  function logout() {
+    storage.delete('token');
+    storage.delete('email');
+    setToken(null);
+    setEmail(null);
+  }
+
+  const value = useMemo(() => ({ token, email, login, logout }), [token, email]);
+  return <AuthCtx.Provider value={value}>{children}</AuthCtx.Provider>;
+}
+
+// --------------------------- API -----------------------------
+async function api<T>(path: string, opts: RequestInit = {}, token?: string | null): Promise<T> {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(opts.headers || {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`API ${path} failed: ${res.status} ${text}`);
+  }
+  return res.json();
+}
+
+// ------------------------ Navigation -------------------------
+const Stack = createNativeStackNavigator();
+
+type Project = {
+  id: string;
+  title: string;
+  creator: string;
+  logline: string;
+  audience: string;
+  mood: string;
+  genre: string;
+  tags: string[];
+  budgetAsk: number;
+  raised: number;
+  likes: number;
+  votes: number;
+  createdAt: number;
+  episodes?: Episode[];
+};
+
+type Episode = {
+  id: string;
+  title: string;
+  description: string;
+  videoUrl: string;
+  posterUrl: string;
+  durationSec: number;
+};
+
+// --------------------------- Screens -------------------------
+function LoginScreen({ navigation }: any) {
+  const { token, login } = useAuth();
+  const [email, setEmail] = useState('you@shortzy.dev');
+  const [name, setName] = useState('Lavanya');
+
+  useEffect(() => {
+    if (token) navigation.replace('Feed');
+  }, [token]);
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <View style={styles.container}> 
+        <Text style={styles.h1}>Shortzy! Mobile</Text>
+        <Text style={styles.p}>Developer Login (email → JWT)</Text>
+        <TextInput style={styles.input} value={email} onChangeText={setEmail} placeholder="Email" autoCapitalize="none" />
+        <TextInput style={styles.input} value={name} onChangeText={setName} placeholder="Name" />
+        <Pressable style={styles.button} onPress={async () => {
+          try { await login(email.trim(), name.trim()); } catch (e: any) { Alert.alert('Login failed', e.message); }
+        }}>
+          <Text style={styles.buttonText}>Continue</Text>
+        </Pressable>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function FeedScreen({ navigation }: any) {
+  const { token } = useAuth();
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [q, setQ] = useState('');
+  const [tag, setTag] = useState('');
+
+  async function load() {
+    const query = new URLSearchParams({ ...(q ? { q } : {}), ...(tag ? { tag } : {}) });
+    const data = await api<{ projects: Project[] }>(`/projects?${query.toString()}`);
+    setProjects(data.projects);
+  }
+
+  useEffect(() => { load(); }, []);
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <View style={styles.headerRow}>
+        <Text style={styles.h1}>Feed</Text>
+        <Pressable style={styles.secondary} onPress={() => navigation.navigate('Insights')}><Text style={styles.secondaryText}>Insights</Text></Pressable>
+      </View>
+      <View style={styles.row}>
+        <TextInput style={[styles.input, { flex: 1 }]} placeholder="Search" value={q} onChangeText={setQ} onSubmitEditing={load} />
+        <TextInput style={[styles.input, { width: 120, marginLeft: 8 }]} placeholder="Tag" value={tag} onChangeText={setTag} onSubmitEditing={load} />
+        <Pressable style={[styles.secondary, { marginLeft: 8 }]} onPress={load}><Text style={styles.secondaryText}>Go</Text></Pressable>
+      </View>
+
+      <FlatList
+        data={projects}
+        keyExtractor={(p) => p.id}
+        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
+        renderItem={({ item: p }) => (
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.cardTitle}>{p.title} <Text style={styles.chip}>{p.genre}</Text></Text>
+                <Text style={styles.meta}>by {p.creator}</Text>
+              </View>
+              <Pressable style={styles.secondary} onPress={() => navigation.navigate('CreateEpisode', { projectId: p.id, projectTitle: p.title })}>
+                <Text style={styles.secondaryText}>+ Episode</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.p}>{p.logline}</Text>
+            <View style={styles.rowBetween}>
+              <Text style={styles.meta}>${p.raised.toLocaleString()} / ${p.budgetAsk.toLocaleString()}</Text>
+              <Text style={styles.meta}>❤️ {p.likes}  ⬆️ {p.votes}</Text>
+            </View>
+            <View style={styles.row}>
+              <Pressable style={styles.buttonSmall} onPress={async () => { await api(`/projects/${p.id}/vote`, { method: 'POST' }, token || undefined); load(); }}>
+                <Text style={styles.buttonText}>Vote</Text>
+              </Pressable>
+              <Pressable style={[styles.buttonSmall, { marginLeft: 8 }]} onPress={async () => { await api(`/projects/${p.id}/like`, { method: 'POST' }, token || undefined); load(); }}>
+                <Text style={styles.buttonText}>Like</Text>
+              </Pressable>
+              <Pressable style={[styles.secondary, { marginLeft: 8 }]} onPress={async () => { await api(`/projects/${p.id}/follow`, { method: 'POST' }, token || undefined); Alert.alert('Followed'); }}>
+                <Text style={styles.secondaryText}>Follow</Text>
+              </Pressable>
+              <Pressable style={[styles.secondary, { marginLeft: 8 }]} onPress={async () => { await api(`/projects/${p.id}/pledge`, { method: 'POST', body: JSON.stringify({ amount: 5 }) }, token || undefined); load(); }}>
+                <Text style={styles.secondaryText}>Pledge $5</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+      />
+
+      <View style={[styles.footerTabs]}> 
+        <Pressable style={styles.tab} onPress={() => navigation.navigate('Feed')}><Text style={styles.tabTextActive}>Feed</Text></Pressable>
+        <Pressable style={styles.tab} onPress={() => navigation.navigate('Pitch')}><Text style={styles.tabText}>Pitch</Text></Pressable>
+        <Pressable style={styles.tab} onPress={() => navigation.navigate('Insights')}><Text style={styles.tabText}>Insights</Text></Pressable>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function PitchScreen() {
+  const { token } = useAuth();
+  const [title, setTitle] = useState('');
+  const [logline, setLogline] = useState('');
+  const [genre, setGenre] = useState('Thriller');
+  const [tags, setTags] = useState('Thriller, Mystery');
+  const [audience, setAudience] = useState('18-34 genre fans');
+  const [mood, setMood] = useState('Dark, sultry');
+  const [budget, setBudget] = useState('50000');
+
+  async function submit() {
+    if (!title || !logline) return Alert.alert('Missing', 'Title & logline required');
+    await api('/projects', {
+      method: 'POST',
+      body: JSON.stringify({
+        title,
+        logline,
+        genre,
+        tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
+        audience,
+        mood,
+        budgetAsk: Number(budget || '0'),
+      }),
+    }, token || undefined);
+    Alert.alert('Created', 'Your project has been created.');
+    setTitle(''); setLogline(''); setAudience(''); setMood(''); setBudget('50000');
+  }
+
+  return (
+    <KeyboardAvoidingView behavior={Platform.select({ ios: 'padding', android: undefined })} style={{ flex: 1 }}>
+      <ScrollView contentContainerStyle={{ padding: 16 }}>
+        <Text style={styles.h1}>Pitch</Text>
+        <TextInput style={styles.input} placeholder="Title" value={title} onChangeText={setTitle} />
+        <TextInput style={[styles.input, styles.inputMultiline]} placeholder="Logline" value={logline} onChangeText={setLogline} multiline />
+        <View style={styles.row}>
+          <TextInput style={[styles.input, { flex: 1 }]} placeholder="Genre" value={genre} onChangeText={setGenre} />
+          <TextInput style={[styles.input, { flex: 1, marginLeft: 8 }]} placeholder="Tags (comma)" value={tags} onChangeText={setTags} />
+        </View>
+        <TextInput style={[styles.input, styles.inputMultiline]} placeholder="Audience" value={audience} onChangeText={setAudience} multiline />
+        <TextInput style={[styles.input, styles.inputMultiline]} placeholder="Mood & tone" value={mood} onChangeText={setMood} multiline />
+        <TextInput style={styles.input} placeholder="Budget Ask (USD)" value={budget} onChangeText={setBudget} keyboardType="numeric" />
+        <Pressable style={styles.button} onPress={submit}><Text style={styles.buttonText}>Create Project</Text></Pressable>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
+}
+
+function CreateEpisodeScreen({ route }: any) {
+  const { token } = useAuth();
+  const { projectId, projectTitle } = route.params || {};
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [videoUrl, setVideoUrl] = useState('');
+  const [posterUrl, setPosterUrl] = useState('');
+  const [durationSec, setDurationSec] = useState('90');
+
+  async function add() {
+    if (!projectId || !title) return Alert.alert('Missing', 'Pick a project and enter a title');
+    await api(`/projects/${projectId}/episodes`, {
+      method: 'POST',
+      body: JSON.stringify({ title, description, videoUrl, posterUrl, durationSec: Number(durationSec) }),
+    }, token || undefined);
+    Alert.alert('Added', 'Episode added');
+    setTitle(''); setDescription(''); setVideoUrl(''); setPosterUrl(''); setDurationSec('90');
+  }
+
+  return (
+    <ScrollView contentContainerStyle={{ padding: 16 }}>
+      <Text style={styles.h1}>Add Episode</Text>
+      <Text style={styles.meta}>Project: {projectTitle || projectId}</Text>
+      <TextInput style={styles.input} placeholder="Episode Title" value={title} onChangeText={setTitle} />
+      <TextInput style={[styles.input, styles.inputMultiline]} placeholder="Description" value={description} onChangeText={setDescription} multiline />
+      <TextInput style={styles.input} placeholder="Video URL (mp4/hls)" value={videoUrl} onChangeText={setVideoUrl} />
+      <TextInput style={styles.input} placeholder="Poster URL" value={posterUrl} onChangeText={setPosterUrl} />
+      <TextInput style={styles.input} placeholder="Duration (sec)" value={durationSec} onChangeText={setDurationSec} keyboardType="numeric" />
+      <Pressable style={styles.button} onPress={add}><Text style={styles.buttonText}>Add Episode</Text></Pressable>
+    </ScrollView>
+  );
+}
+
+function InsightsScreen() {
+  const [stats, setStats] = useState<{ projects: number; votes: number; likes: number; raised: number } | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const data = await api<{ projects: number; votes: number; likes: number; raised: number }>(`/insights/overview`);
+      setStats(data);
+    })();
+  }, []);
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <View style={{ padding: 16 }}>
+        <Text style={styles.h1}>Insights</Text>
+        {stats ? (
+          <View>
+            <View style={styles.metric}><Text style={styles.metricLabel}>Projects</Text><Text style={styles.metricValue}>{stats.projects}</Text></View>
+            <View style={styles.metric}><Text style={styles.metricLabel}>Votes</Text><Text style={styles.metricValue}>{stats.votes}</Text></View>
+            <View style={styles.metric}><Text style={styles.metricLabel}>Likes</Text><Text style={styles.metricValue}>{stats.likes}</Text></View>
+            <View style={styles.metric}><Text style={styles.metricLabel}>Raised</Text><Text style={styles.metricValue}>${(stats.raised || 0).toLocaleString()}</Text></View>
+          </View>
+        ) : (
+          <Text style={styles.p}>Loading…</Text>
+        )}
+      </View>
+    </SafeAreaView>
+  );
+}
+
+// --------------------------- App Root ------------------------
+export default function App() {
+  return (
+    <AuthProvider>
+      <NavigationContainer>
+        <Stack.Navigator>
+          <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
+          <Stack.Screen name="Feed" component={FeedScreen} options={{ title: 'Shortzy! Feed' }} />
+          <Stack.Screen name="Pitch" component={PitchScreen} options={{ title: 'Pitch Project' }} />
+          <Stack.Screen name="CreateEpisode" component={CreateEpisodeScreen} options={{ title: 'Add Episode' }} />
+          <Stack.Screen name="Insights" component={InsightsScreen} options={{ title: 'Insights' }} />
+        </Stack.Navigator>
+      </NavigationContainer>
+    </AuthProvider>
+  );
+}
+
+// ----------------------------- Styles -----------------------
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: '#0b0b0c' },
+  container: { flex: 1, padding: 16, justifyContent: 'center' },
+  h1: { fontSize: 24, fontWeight: '700', color: '#fff', marginBottom: 12 },
+  p: { fontSize: 14, color: '#d0d0d1', marginBottom: 12 },
+  input: { backgroundColor: '#1a1a1c', color: '#fff', borderRadius: 12, padding: 12, marginBottom: 8, borderWidth: 1, borderColor: '#2a2a2d' },
+  inputMultiline: { minHeight: 80, textAlignVertical: 'top' },
+  button: { backgroundColor: '#6b8afd', borderRadius: 14, paddingVertical: 12, alignItems: 'center', marginTop: 8 },
+  buttonSmall: { backgroundColor: '#6b8afd', borderRadius: 12, paddingVertical: 8, paddingHorizontal: 14, alignItems: 'center', marginTop: 8 },
+  buttonText: { color: '#0b0b0c', fontWeight: '700' },
+  secondary: { backgroundColor: '#1a1a1c', borderRadius: 12, paddingVertical: 8, paddingHorizontal: 12, borderColor: '#2a2a2d', borderWidth: 1 },
+  secondaryText: { color: '#d0d0d1', fontWeight: '600' },
+  card: { backgroundColor: '#121214', borderRadius: 16, padding: 14, marginTop: 12, borderColor: '#1e1e21', borderWidth: 1 },
+  cardHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  cardTitle: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  meta: { color: '#a0a0a6', fontSize: 12, marginTop: 4 },
+  row: { flexDirection: 'row', alignItems: 'center', marginTop: 8 },
+  rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 },
+  headerRow: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  footerTabs: { position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', borderTopColor: '#1e1e21', borderTopWidth: 1, backgroundColor: '#0b0b0c' },
+  tab: { flex: 1, padding: 12, alignItems: 'center' },
+  tabText: { color: '#a0a0a6' },
+  tabTextActive: { color: '#fff', fontWeight: '700' },
+  chip: { fontSize: 12, color: '#a0a0a6' },
+  metric: { backgroundColor: '#121214', borderRadius: 16, padding: 14, marginTop: 12, borderColor: '#1e1e21', borderWidth: 1, flexDirection: 'row', justifyContent: 'space-between' },
+  metricLabel: { color: '#a0a0a6', fontSize: 14 },
+  metricValue: { color: '#fff', fontSize: 16, fontWeight: '700' },
+});
