@@ -1,0 +1,314 @@
+/*
+ Shortzy! MVP Backend – single-file Node + Express server (TypeScript)
+ --------------------------------------------------------------------
+ What you get:
+ - SQLite persistence (better-sqlite3) with simple schema
+ - Dev auth via email (no password) issuing JWTs
+ - Projects CRUD-lite, Episodes add, Votes/Likes/Follows, Mock Pledges
+ - Simple Insights endpoints
+ - (Mock) signed upload URL endpoint you can swap for S3/Cloudflare R2
+ - Zod validation; Helmet, CORS, basic rate-limit
+
+ Quick start
+ 1) npm init -y && npm i express zod jsonwebtoken cors helmet express-rate-limit better-sqlite3
+ 2) npm i -D typescript ts-node @types/node @types/express @types/jsonwebtoken @types/cors
+ 3) npx tsc --init
+ 4) Put this file as src/server.ts
+ 5) Create .env with JWT_SECRET="devsecret" and (optional) PORT=4000
+ 6) npm run dev => add script: "dev": "ts-node src/server.ts"
+
+ Replace the mock /uploads/sign with a real storage signer when ready.
+*/
+
+import 'dotenv/config';
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
+import Database from 'better-sqlite3';
+import { z } from 'zod';
+
+// ------------------------- Setup & DB -------------------------
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(cors({ origin: true, credentials: true }));
+app.use(helmet());
+
+const limiter = rateLimit({ windowMs: 60_000, max: 120 });
+app.use(limiter);
+
+const PORT = Number(process.env.PORT || 4000);
+const JWT_SECRET = process.env.JWT_SECRET || 'devsecret';
+
+const db = new Database('shortzy.db');
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    name TEXT,
+    created_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    logline TEXT,
+    audience TEXT,
+    mood TEXT,
+    genre TEXT,
+    tags TEXT,
+    budget_ask INTEGER DEFAULT 0,
+    raised INTEGER DEFAULT 0,
+    likes INTEGER DEFAULT 0,
+    votes INTEGER DEFAULT 0,
+    created_at INTEGER,
+    FOREIGN KEY (creator_id) REFERENCES users(id)
+  );
+  CREATE TABLE IF NOT EXISTS episodes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    video_url TEXT,
+    poster_url TEXT,
+    duration_sec INTEGER,
+    created_at INTEGER,
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+  );
+  CREATE TABLE IF NOT EXISTS follows (
+    user_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    created_at INTEGER,
+    PRIMARY KEY (user_id, project_id)
+  );
+`);
+
+// ------------------------- Utils -------------------------
+const uid = (p = 'id') => `${p}_${Math.random().toString(36).slice(2, 9)}`;
+
+function sign(user: { id: string; email: string; name?: string | null }) {
+  return jwt.sign({ sub: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '14d' });
+}
+
+function auth(req: Request, res: Response, next: NextFunction) {
+  const h = req.headers.authorization;
+  if (!h) return res.status(401).json({ error: 'missing_auth' });
+  const token = h.replace('Bearer ', '');
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as any;
+    (req as any).user = { id: payload.sub, email: payload.email, name: payload.name };
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+}
+
+const ProjectCreate = z.object({
+  title: z.string().min(2),
+  logline: z.string().min(5),
+  audience: z.string().optional().default(''),
+  mood: z.string().optional().default(''),
+  genre: z.string().optional().default('Drama'),
+  tags: z.array(z.string()).optional().default([]),
+  budgetAsk: z.number().int().nonnegative().default(0),
+});
+
+const EpisodeCreate = z.object({
+  title: z.string().min(2),
+  description: z.string().optional().default(''),
+  videoUrl: z.string().url().optional().default(''),
+  posterUrl: z.string().url().optional().default(''),
+  durationSec: z.number().int().positive().max(15 * 60).default(90),
+});
+
+// ---------------------- Seed (dev only) ----------------------
+function devSeed() {
+  const hasUser = db.prepare('SELECT COUNT(*) as c FROM users').get() as any;
+  if (hasUser.c > 0) return;
+  const now = Date.now();
+  const u1 = { id: uid('usr'), email: 'mangalani@shortzy.dev', name: 'Mangalani', created_at: now };
+  const u2 = { id: uid('usr'), email: 'studio@orbit.dev', name: 'Orbit Pictures', created_at: now };
+  db.prepare('INSERT INTO users (id,email,name,created_at) VALUES (@id,@email,@name,@created_at)').run(u1);
+  db.prepare('INSERT INTO users (id,email,name,created_at) VALUES (@id,@email,@name,@created_at)').run(u2);
+  const p1 = { id: uid('prj'), title: 'Oracle', creator_id: u1.id, logline: 'A violinist haunted by prophetic glitches must stop a murder only she can see in fragments.', audience: '18-34 genre fans', mood: 'Dark, sultry', genre: 'Thriller', tags: JSON.stringify(['Thriller','Mystery']), budget_ask: 75000, raised: 22000, likes: 1430, votes: 987, created_at: now };
+  const p2 = { id: uid('prj'), title: 'Chartreuse', creator_id: u2.id, logline: 'Two friends infiltrate a monastery to steal a legendary recipe.', audience: 'Gen Z buddy-comedy', mood: 'Warm, offbeat', genre: 'Comedy', tags: JSON.stringify(['Comedy','Adventure']), budget_ask: 50000, raised: 12000, likes: 780, votes: 412, created_at: now };
+  db.prepare(`INSERT INTO projects (id,title,creator_id,logline,audience,mood,genre,tags,budget_ask,raised,likes,votes,created_at)
+              VALUES (@id,@title,@creator_id,@logline,@audience,@mood,@genre,@tags,@budget_ask,@raised,@likes,@votes,@created_at)`).run(p1);
+  db.prepare(`INSERT INTO projects (id,title,creator_id,logline,audience,mood,genre,tags,budget_ask,raised,likes,votes,created_at)
+              VALUES (@id,@title,@creator_id,@logline,@audience,@mood,@genre,@tags,@budget_ask,@raised,@likes,@votes,@created_at)`).run(p2);
+  const ep = { id: uid('ep'), project_id: p1.id, title: 'Pilot – The Glitch', description: 'First sighting. Reality tears like film stock.', video_url: '', poster_url: '', duration_sec: 108, created_at: now };
+  db.prepare(`INSERT INTO episodes (id,project_id,title,description,video_url,poster_url,duration_sec,created_at)
+              VALUES (@id,@project_id,@title,@description,@video_url,@poster_url,@duration_sec,@created_at)`).run(ep);
+}
+
+devSeed();
+
+// ------------------------- Routes -------------------------
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// Auth (dev): POST /auth/dev-login { email, name? }
+app.post('/auth/dev-login', (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const name = String(req.body?.name || '').trim() || null;
+  if (!email) return res.status(400).json({ error: 'email_required' });
+  let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
+  if (!user) {
+    user = { id: uid('usr'), email, name, created_at: Date.now() };
+    db.prepare('INSERT INTO users (id,email,name,created_at) VALUES (@id,@email,@name,@created_at)').run(user);
+  }
+  const token = sign(user);
+  res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+});
+
+// Me
+app.get('/me', auth, (req, res) => {
+  res.json({ user: (req as any).user });
+});
+
+// List projects
+app.get('/projects', (req, res) => {
+  const q = String(req.query.q || '').toLowerCase();
+  const tag = String(req.query.tag || '');
+  const rows = db.prepare('SELECT p.*, u.name as creator_name FROM projects p JOIN users u ON p.creator_id = u.id ORDER BY p.created_at DESC').all() as any[];
+  const list = rows
+    .map(r => rowToProject(r))
+    .filter(p => (q ? matchText(p, q) : true))
+    .filter(p => (tag ? p.tags.includes(tag) : true));
+  res.json({ projects: list });
+});
+
+// Get one
+app.get('/projects/:id', (req, res) => {
+  const id = req.params.id;
+  const r = db.prepare('SELECT p.*, u.name as creator_name FROM projects p JOIN users u ON p.creator_id = u.id WHERE p.id = ?').get(id) as any;
+  if (!r) return res.status(404).json({ error: 'not_found' });
+  const proj = rowToProject(r);
+  const eps = db.prepare('SELECT * FROM episodes WHERE project_id = ? ORDER BY created_at DESC').all(id) as any[];
+  proj.episodes = eps.map(e => rowToEpisode(e));
+  res.json({ project: proj });
+});
+
+// Create project
+app.post('/projects', auth, (req, res) => {
+  const parsed = ProjectCreate.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const data = parsed.data;
+  const now = Date.now();
+  const id = uid('prj');
+  db.prepare(`INSERT INTO projects (id,title,creator_id,logline,audience,mood,genre,tags,budget_ask,raised,likes,votes,created_at)
+              VALUES (@id,@title,@creator_id,@logline,@audience,@mood,@genre,@tags,@budget_ask,0,0,0,@created_at)`).run({
+    id,
+    title: data.title,
+    creator_id: (req as any).user.id,
+    logline: data.logline,
+    audience: data.audience,
+    mood: data.mood,
+    genre: data.genre,
+    tags: JSON.stringify(data.tags),
+    budget_ask: data.budgetAsk,
+    created_at: now,
+  });
+  res.status(201).json({ id });
+});
+
+// Add episode
+app.post('/projects/:id/episodes', auth, (req, res) => {
+  const parsed = EpisodeCreate.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const p = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id) as any;
+  if (!p) return res.status(404).json({ error: 'project_not_found' });
+  const ep = { id: uid('ep'), project_id: p.id, title: parsed.data.title, description: parsed.data.description, video_url: parsed.data.videoUrl, poster_url: parsed.data.posterUrl, duration_sec: parsed.data.durationSec, created_at: Date.now() };
+  db.prepare(`INSERT INTO episodes (id,project_id,title,description,video_url,poster_url,duration_sec,created_at)
+              VALUES (@id,@project_id,@title,@description,@video_url,@poster_url,@duration_sec,@created_at)`).run(ep);
+  res.status(201).json({ id: ep.id });
+});
+
+// Vote / Like / Follow / Pledge (mock)
+app.post('/projects/:id/vote', auth, (req, res) => {
+  const p = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id) as any;
+  if (!p) return res.status(404).json({ error: 'project_not_found' });
+  const inc = Math.round((p.budget_ask || 0) * 0.01);
+  db.prepare('UPDATE projects SET votes = votes + 1, raised = MIN(budget_ask, raised + ?) WHERE id = ?').run(inc, p.id);
+  res.json({ ok: true });
+});
+
+app.post('/projects/:id/like', auth, (_req, res) => {
+  db.prepare('UPDATE projects SET likes = likes + 1 WHERE id = ?').run(_req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/projects/:id/follow', auth, (req, res) => {
+  const pair = { user_id: (req as any).user.id, project_id: req.params.id, created_at: Date.now() };
+  try {
+    db.prepare('INSERT INTO follows (user_id,project_id,created_at) VALUES (@user_id,@project_id,@created_at)').run(pair);
+  } catch { /* ignore duplicate */ }
+  res.json({ ok: true });
+});
+
+app.post('/projects/:id/pledge', auth, (req, res) => {
+  const amount = Number(req.body?.amount || 5);
+  const p = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id) as any;
+  if (!p) return res.status(404).json({ error: 'project_not_found' });
+  db.prepare('UPDATE projects SET raised = MIN(budget_ask, raised + ?) WHERE id = ?').run(Math.max(1, amount), p.id);
+  res.json({ ok: true });
+});
+
+// Insights
+app.get('/insights/overview', (_req, res) => {
+  const totals = db.prepare('SELECT COUNT(*) as projects FROM projects').get() as any;
+  const votes = db.prepare('SELECT SUM(votes) as votes, SUM(likes) as likes, SUM(raised) as raised FROM projects').get() as any;
+  res.json({ projects: totals.projects || 0, votes: votes.votes || 0, likes: votes.likes || 0, raised: votes.raised || 0 });
+});
+
+// Upload signer (mock)
+app.post('/uploads/sign', auth, (req, res) => {
+  const filename = String(req.body?.filename || 'upload.bin');
+  const pretendUrl = `https://uploads.shortzy.local/${Date.now()}_${encodeURIComponent(filename)}`;
+  res.json({ url: pretendUrl, method: 'PUT', headers: { 'x-mock': 'true' } });
+});
+
+// --------------------- Helpers (mappers) ---------------------
+function rowToProject(r: any) {
+  return {
+    id: r.id,
+    title: r.title,
+    creatorId: r.creator_id,
+    creator: r.creator_name,
+    logline: r.logline,
+    audience: r.audience,
+    mood: r.mood,
+    genre: r.genre,
+    tags: JSON.parse(r.tags || '[]') as string[],
+    budgetAsk: r.budget_ask || 0,
+    raised: r.raised || 0,
+    likes: r.likes || 0,
+    votes: r.votes || 0,
+    createdAt: r.created_at,
+  } as any;
+}
+
+function rowToEpisode(e: any) {
+  return {
+    id: e.id,
+    projectId: e.project_id,
+    title: e.title,
+    description: e.description,
+    videoUrl: e.video_url,
+    posterUrl: e.poster_url,
+    durationSec: e.duration_sec,
+    createdAt: e.created_at,
+  } as any;
+}
+
+function matchText(p: any, q: string) {
+  const hay = `${p.title} ${p.creator} ${p.genre} ${p.logline} ${(p.tags||[]).join(' ')}`.toLowerCase();
+  return q.split(/\s+/).every(tok => hay.includes(tok));
+}
+
+// ------------------------- Server -------------------------
+app.listen(PORT, () => {
+  console.log(`Shortzy! API running on http://localhost:${PORT}`);
+});
