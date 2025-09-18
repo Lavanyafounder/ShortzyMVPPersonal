@@ -1,0 +1,54 @@
+######### 
+To run locally in a new folder:
+
+npm init -y
+npm i express zod jsonwebtoken cors helmet express-rate-limit better-sqlite3
+npm i -D typescript ts-node @types/node @types/express @types/jsonwebtoken @types/cors
+npx tsc --init
+
+
+
+#Create .env 
+JWT_SECRET=devsecret
+PORT=4000
+
+
+Save the canvas file as src/server.ts and run:
+
+npm run dev
+# package.json → "dev": "ts-node src/server.ts"
+
+
+Minimal API walkthrough (curl)
+# 1) Dev login
+curl -sX POST localhost:4000/auth/dev-login -H 'Content-Type: application/json' \
+  -d '{"email":"you@shortzy.dev","name":"Lavanya"}' | jq '.token' > token.txt
+TOKEN=$(cat token.txt | tr -d '"')
+
+# 2) List projects
+curl -s localhost:4000/projects | jq
+
+# 3) Create a project
+curl -sX POST localhost:4000/projects -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Forbidden Game","logline":"Teens trapped in a deadly game of their fears.","genre":"Thriller","tags":["Thriller","Romance"],"budgetAsk":75000}' | jq
+
+# 4) Add an episode
+curl -sX POST localhost:4000/projects/<PROJECT_ID>/episodes -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Ep1","description":"Cold open","videoUrl":"https://cdn.example/ep1.mp4","posterUrl":"https://cdn.example/ep1.jpg","durationSec":95}'
+
+
+
+Hooking the React MVP to this API
+Swap the front-end localStorage calls for fetches to:
+GET /projects, GET /projects/:id
+POST /projects (on pitch submit)
+POST /projects/:id/episodes (create tab)
+POST /projects/:id/{vote|like|follow|pledge} (feed)
+On app load, call POST /auth/dev-login with your email and stash the JWT in memory/localStorage; attach it as Authorization: Bearer <token>.
+Next steps (pick any)
+Real storage: replace /uploads/sign with S3/R2 presigned URLs; wire the React uploader.
+Payments: add Stripe Checkout or Payment Links for pledges; convert “votes” into “pre-buys.”
+Auth: magic-link via Postmark/Resend + short-lived tokens.
+Roles & moderation: add role on users, review queue, takedown flow.
+Metrics: write events (view/like/vote/follow) to a tiny events table and chart them in Insights.
+Search: add LIKE/FTS5 on title/logline/tags.
